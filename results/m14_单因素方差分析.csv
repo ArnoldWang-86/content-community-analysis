@@ -1,0 +1,14 @@
+指标,值
+纳入分区数,21
+纳入样本数,17483
+F 值,64.288
+p 值,1.112e-250
+Welch F,84.464
+Welch p,1.984e-264
+Kruskal-Wallis H,1610.0
+Kruskal-Wallis p,0.000e+00
+eta^2 效应量,0.0686
+效应等级,中
+Tukey 显著对数,130
+Tukey 总对数,210
+Levene p,1.541e-77
