@@ -1,0 +1,2 @@
+问题,SQL,返回行数,重试次数,触发自愈,耗时秒,解读
+带「教程」标签的视频和不带的，互动率差多少？,"SELECT CASE WHEN vt.bvid IS NOT NULL THEN '带教程标签' ELSE '不带教程标签' END AS tag_group, COUNT(*) AS sample_cnt, ROUND(AVG(v.interact_rate) * 100, 4) AS avg_interact_rate_pct, ROUND(AVG(v.view_cnt), 2) AS avg_view_cnt FROM video v LEFT JOIN (SELECT DISTINCT bvid FROM video_tag WHERE tag = '教程') vt ON v.bvid = vt.bvid GROUP BY tag_group ORDER BY tag_group",2,0,否,4.3,带「教程」标签的视频互动率为9.25%，明显高于不带标签的7.59%，高出约1.66个百分点（相对提升约22%）。不过带标签样本仅785条，远少于不带标签的18671条，且其平均播放量（21.7万）反而低于不带标签的（44.8万），说明教程类内容虽互动更强但曝光规模偏小，结论需结合样本量谨慎看待。
