@@ -4,7 +4,7 @@
 
 为此我从 B站公开接口采了 28,000 条视频数据，清洗掉广告和异常值之后留下 19,456 条，覆盖 109 个内容分区、11,841 个 UP 主。除了视频本身的数据，我还额外采了 271 万条弹幕，用来看看观众到底在说什么。
 
-围绕这批数据做的事情大致是：采集，清洗入库 MySQL，写 12 条 SQL 做分析，跑统计检验和建模，最后做了一个交互式看板。下面按我实际做的顺序说，中间踩的坑比结论更有意思。
+围绕这批数据做的事情大致是：采集，清洗入库 MySQL，写 12 条 SQL 做分析，跑统计检验和建模，用大模型把整条取数与解读流程自动化，最后做了一个交互式看板。下面按我实际做的顺序说，中间踩的坑比结论更有意思。
 
 ---
 
@@ -214,6 +214,99 @@ PSM 和 IPTW 都是在"没有实验"的前提下做的补救。那如果真的�
 
 ---
 
+## 用大模型把分析流程自动化
+
+前面所有分析都是我手写的。做的过程中我意识到一个问题：**同一套取数逻辑，换个业务方问法就要重写一遍。**
+
+所以我做了一个 Text-to-SQL 数据 Agent——输入一句自然语言，输出 SQL、数据和业务解读。
+
+### 它不是「调一次 API 生成 SQL」
+
+把问题丢给模型让它生成 SQL，执行，输出——大部分 Demo 到这里就结束了。但真实场景里第一次写错是常态，所以我把中间拆成了七步：
+
+#B3#
+问题
+ ├─ ① 语义层        手写字段的业务含义、计算口径与已知陷阱
+ ├─ ② SQL 生成      DeepSeek API，输出结构化 JSON（sql + intent + 用到的表）
+ ├─ ③ 安全闸门      白名单校验，只放行单条 SELECT，拦截一切写操作
+ ├─ ④ 执行          MySQL，行数截断后再回传
+ ├─ ⑤ 错误自愈      把「问题 + 错误SQL + MySQL报错」回喂 → 重写 → 重试（≤3 次）
+ ├─ ⑥ 结果解读      把查询结果翻译成业务结论
+ └─ ⑦ 自动出图      按结果结构判断用折线、柱状还是饼图
+#B3#
+
+### 第一版跑出来的结论是错的
+
+这是这个项目里最有价值的一次失败。
+
+第一次问「哪个内容分区的平均互动率最高」，模型给出的 SQL 语法完全正确：
+
+#B3#sql
+SELECT c.tname, AVG(v.interact_rate) AS rate
+FROM video v JOIN category c ON v.tid = c.tid
+GROUP BY c.tname ORDER BY rate DESC LIMIT 5
+#B3#
+
+跑出来的答案是「音乐教学 25.42%」。
+
+**但这个分区只有 3 条视频。**
+
+SQL 本身没有错，错的是业务口径——模型不知道聚合时要过滤小样本。我在语义层里补上统计可靠性规则后，它自动生成了带过滤条件的 SQL：
+
+#B3#sql
+... HAVING COUNT(*) >= 30 ...
+#B3#
+
+结论也变成了有意义的结果：仿妆cos 11.62%（91 条样本）、计算机技术 10.44%（2,190 条样本，最扎实）。
+
+**这件事让我确认了一点：Text-to-SQL 的瓶颈不在 SQL 生成，而在你喂给它多少业务口径。**
+
+### 语义层：把数据库的「潜规则」显式写出来
+
+我们数据库的字段没有 COMMENT，模型不可能猜到 `duration_s` 对多P合集返回的是所有分P的累计时长。所以我把字段的业务含义、计算口径和已知陷阱单独维护成一份语义层，和数据库本身解耦：
+
+| 字段 | 语义层里写了什么 |
+|---|---|
+| `interact_rate` | 已定义为（点赞+投币+收藏）/播放量，并做过 1%/99% 截尾，**分析时直接用它，不要重算** |
+| `duration_s` | ⚠️ 多P合集返回的是**累计时长**（最长 817 小时），涉及时长的分析必须说明 |
+| `follower` | ⚠️ 是**采集时的当前值**，不是发布时的值，做预测会构成时间穿越 |
+| 聚合口径 | 样本量 < 30 的分区统计不可靠，**取平均值 Top-N 必须加 HAVING COUNT(*) >= 30** |
+
+### 错误自愈：注入 3 种故障，3 种全部修复
+
+模型在简单问题上一次就写对，自愈逻辑根本不会被触发。所以我写了故障注入器，主动制造失败来验证容错路径真的有效：
+
+| 注入的故障 | MySQL 报错 | 结果 |
+|---|---|---|
+| 字段名幻觉：`interact_rate` → `interaction_rate` | (1054) Unknown column | 自动改回 |
+| 表名幻觉：`category` → `categorys` | (1146) Table doesn't exist | 自动改回 |
+| 语法错误：`GROUP BY` → `GROP BY` | (1064) SQL syntax error | 自动改回 |
+
+模型修完还会解释原因：
+
+> "报错原因：video 表中不存在 interaction_rate 列，实际字段名为 interact_rate（口径为 (点赞+投币+收藏)/播放量，已截尾）。修正：将 AVG(v.interaction_rate) 改为 AVG(v.interact_rate)。"
+
+**故障注入本来就是工程上验证容错逻辑的标准做法。** 一个只会生成一次的系统，在模型幻觉面前毫无还手之力；而一个能「执行 → 观察 → 修正」的系统，就有了自我纠错能力。
+
+### 顺手把 Prompt 抽成了库
+
+做完 Agent 后我发现，项目里已经有 4 个 Prompt 分散硬编码在各个脚本中——换项目要复制粘贴、改了不知道改哪份、没法单独测试。于是我抽成了 `src/prompts.py`：
+
+每个 Prompt 拆成**角色、上下文、任务、约束、输出格式**几个独立字段，而不是揉成一大段字符串。约束用清单而不用自然段，因为清单才能逐条增删和做回归验证。
+
+更重要的是，**每个 Prompt 都跟着一段设计说明，记录为什么这么写**。比如 `sql_repair` 里有一条约束是「只修改报错的部分」——这是实测加上的，不加的话模型会重写整条 SQL，有时把原本正确的业务口径（比如 `HAVING COUNT(*) >= 30`）一并改掉。**修复行为本身也需要被约束。**
+
+意图分类的 Prompt 还带着完整的版本迭代记录：v1.0 时「提问」类有约 40% 误判（模型把「时间复杂度」这种纯术语也当成提问），v2.0 加了可判定的条件和显式反例后，人工抽检正确率从约 60% 升到 90%。
+
+命令行可以查看任意一个 Prompt 的完整定义和设计说明：
+
+#B3#bash
+python src/prompts.py --list
+python src/prompts.py --show sql_repair
+#B3#
+
+---
+
 ## 项目结构
 
 ```
@@ -232,7 +325,9 @@ PSM 和 IPTW 都是在"没有实验"的前提下做的补救。那如果真的�
 │ ├── 09_build_dashboard.py 交互式看板生成
 │ ├── 10_psm_causal.py 倾向得分匹配 + 逆概率加权的因果推断
 │ ├── 11_power_analysis.py A/B 实验功效分析与样本量测算
-│ └── 12_anova.py 单因素方差分析与 Tukey HSD 事后检验
+│ ├── 12_anova.py 单因素方差分析与 Tukey HSD 事后检验
+│ ├── 13_text_to_sql_agent.py Text-to-SQL 数据 Agent（七步流水线）
+│ └── prompts.py 可复用 Prompt 模板库
 ├── sql/
 │ ├── 01_schema.sql 4 张表结构
 │ └── 02_analysis.sql 12 条分析 SQL
@@ -253,7 +348,7 @@ PSM 和 IPTW 都是在"没有实验"的前提下做的补救。那如果真的�
 
 统计检验用 SciPy（Welch t 检验、Mann-Whitney U、Levene、Shapiro-Wilk）。建模用 scikit-learn（KMeans、逻辑回归、随机森林），特征归因用 SHAP。
 
-意图标注调的是 DeepSeek API，用了 JSON 输出模式、4 并发和断点续跑。看板用 Plotly。
+意图标注和 Text-to-SQL Agent 调的都是 DeepSeek API，用了 JSON 输出模式、语义层注入、并发控制和断点续跑。Prompt 统一收在 `src/prompts.py` 里做模板化和版本管理。看板用 Plotly。
 
 写代码的过程中大部分时间开着 Claude Code，主要用来处理报错日志和写重复性脚本。
 
@@ -284,6 +379,12 @@ python src/07_stats_model.py
 python src/10_psm_causal.py
 python src/11_power_analysis.py
 python src/12_anova.py
+
+# 自然语言问数（Text-to-SQL Agent）
+python src/13_text_to_sql_agent.py                       # 内置示例问题
+python src/13_text_to_sql_agent.py -q "哪个分区互动率最高"  # 单个问题
+python src/13_text_to_sql_agent.py -i                    # 交互模式
+python src/13_text_to_sql_agent.py --fault-demo          # 故障注入，验证错误自愈
 
 # 生成看板
 python src/09_build_dashboard.py
