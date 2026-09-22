@@ -332,9 +332,15 @@ python src/prompts.py --show sql_repair
 │ ├── 01_schema.sql 4 张表结构
 │ └── 02_analysis.sql 12 条分析 SQL
 ├── dashboard/index.html 交互式看板（单文件）
-├── results/ 22 个结果 CSV
-├── images/ 6 张图表
+├── results/ 26 个结果 CSV
+├── images/ 7 张图表
+├── tests/ pytest 测试套件（61 用例 + 2 xfail）
+│ ├── test_sql_guard.py SQL 安全闸门（24 条 Excel 用例驱动）
+│ ├── test_fault_injection.py 故障注入与容错验证
+│ ├── test_schema_rules.py 语义层规则 + Prompt 库结构
+│ └── test_db_execution.py 数据库执行
 ├── docs/
+│ ├── 产品设计文档.md 需求 / 优先级 / 方案 / 关键取舍 / 衡量指标
 │ ├── 操作手册.md 完整操作流程
 │ └── 标注质量分析.md 93.0% 准确率 + 误差分析
 └── data/ 原始数据（已 gitignore，可由脚本复现）
