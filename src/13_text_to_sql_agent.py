@@ -174,6 +174,8 @@ class AgentResult:
     healed: bool = False
     errors: list = field(default_factory=list)
     seconds: float = 0.0
+    chart_path: str = ""
+    metric: str = ""
 
 
 # ==============================================================
@@ -215,7 +217,22 @@ class DataAgent:
     # ---------- 环节 4：执行 ----------
     @staticmethod
     def execute_sql(sql):
-        return pd.DataFrame(query(sql))
+        """执行 SQL 并把结果做类型规范化
+
+        ⚠️ 这里踩过一个坑：MySQL 的 DECIMAL 类型（例如 ROUND(AVG(x), 4) 的返回值）
+        经 pymysql 映射后是 Python 的 Decimal 对象，pandas 会把它存成 object 类型。
+        后果是——明明是指标列，却被后续逻辑判断成"类别列"，
+        导致自动出图选错 Y 轴（画成了各组的样本量，看起来很正常但答非所问）。
+
+        对应做法：对所有 object 列尝试转数值，能全部转过来说明它本来就是数值列。
+        """
+        df = pd.DataFrame(query(sql))
+        for c in df.columns:
+            if df[c].dtype == object:
+                conv = pd.to_numeric(df[c], errors="coerce")
+                if conv.notna().all():
+                    df[c] = conv
+        return df
 
     # ---------- 环节 5：错误自愈 ----------
     def repair_sql(self, question, bad_sql, error_msg):
@@ -233,6 +250,82 @@ class DataAgent:
                               preview=preview)
         return self.llm.chat(msgs, json_mode=False).strip()
 
+    # ---------- 环节 7：自动出图 ----------
+    @staticmethod
+    def pick_chart(df, metric=None):
+        """按结果结构决定画什么图，返回 (类型, x列, y列) 或 None
+
+        metric: 由模型在上一步指定的"该展示哪个指标列"。
+                代码不知道"用户问的是互动率还是播放量"，但模型知道 ——
+                这是本项目「模型负责理解、代码负责确定的事」这一分工的体现。
+        
+
+        这里是**规则**而不是让模型决定 —— 图表类型是确定性问题，
+        规则比模型更稳定，也省一次 API 调用。模型负责"理解问题"，
+        代码负责"确定的事"，这个分工贯穿整个 Agent。
+        """
+        import pandas as _pd
+        if df is None or df.empty or len(df) < 2:
+            return None
+        num_cols = [c for c in df.columns
+                    if _pd.api.types.is_numeric_dtype(df[c])]
+        cat_cols = [c for c in df.columns if c not in num_cols]
+        if not num_cols or not cat_cols:
+            return None
+
+        # ⚠️ 关键：数值列里往往第一个是"样本量"，它是用来判断可信度的，
+        #    不是要展示的指标。直接取第一列会把图画成"各组样本量占比"，
+        #    看起来很正常但答非所问 —— 这个 bug 是靠肉眼看图才发现的，
+        #    任何断言式测试都抓不到它。
+        COUNT_KW = ("count", "cnt", "样本量", "数量", "行数", "个数", "总数", "n_")
+        metrics = [c for c in num_cols
+                   if not any(k in str(c).lower() for k in COUNT_KW)]
+
+        # 优先用模型指定的指标列；指定得不对再退回启发式
+        y = None
+        if metric:
+            for c in num_cols:
+                if str(c) == str(metric) or str(metric) in str(c):
+                    y = c
+                    break
+        if y is None:
+            y = metrics[0] if metrics else num_cols[-1]
+        x = cat_cols[0]
+        # x 是有序维度（小时 / 年份 / 月份 / 日期）→ 折线
+        ordered_kw = ("小时", "hour", "月", "month", "年", "year",
+                      "日期", "date", "天", "day", "周", "week", "序号")
+        if any(k in str(x).lower() for k in ordered_kw):
+            return "line", x, y
+        # 类别少且只有一个数值列 → 饼图
+        if len(df) <= 8 and len(num_cols) == 1:
+            return "pie", x, y
+        return "bar", x, y
+
+    def visualize(self, question, df, out_dir=None, metric=None):
+        """按 pick_chart 的判断生成 Plotly 图并落盘，返回文件路径"""
+        pick = self.pick_chart(df, metric=metric)
+        if pick is None:
+            self.log("      结果结构不适合出图（缺少类别列或数值列），跳过")
+            return None
+        kind, x, y = pick
+        import plotly.express as px
+        d = df.head(30).copy()
+        title = question[:40]
+        if kind == "line":
+            fig = px.line(d, x=x, y=y, markers=True, title=title)
+        elif kind == "pie":
+            fig = px.pie(d, names=x, values=y, title=title, hole=0.4)
+        else:
+            fig = px.bar(d, x=x, y=y, title=title)
+        fig.update_layout(height=420, margin=dict(l=10, r=10, t=50, b=10))
+
+        out_dir = out_dir or os.path.join(ROOT, "output")
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = time.strftime("%H%M%S")
+        path = os.path.join(out_dir, "agent_chart_%s.html" % stamp)
+        fig.write_html(path, include_plotlyjs="cdn")
+        return path
+
     # ---------- 主流程 ----------
     def ask(self, question, inject_fault=None):
         """inject_fault: 可选的 (名称, 破坏函数)，用于演示错误自愈能力
@@ -249,9 +342,12 @@ class DataAgent:
         self.log(SEP)
 
         # (2) 生成
-        self.log("\n[1/5] 生成 SQL ...")
+        self.log("\n[1/6] 生成 SQL ...")
         gen = self.generate_sql(question)
         res.sql = gen.get("sql", "").strip()
+        res.metric = gen.get("metric", "")
+        if res.metric:
+            self.log("      metric : %s（将作为图表 Y 轴）" % res.metric)
         if inject_fault is not None:
             fname, fn = inject_fault
             res.sql, desc = fn(res.sql)
@@ -263,7 +359,7 @@ class DataAgent:
         self.log("      SQL    :\n" + "\n".join("        " + l for l in res.sql.split("\n")))
 
         # (3)(4)(5) 校验 → 执行 → 自愈
-        self.log("\n[2/5] 安全校验 ...")
+        self.log("\n[2/6] 安全校验 ...")
         try:
             res.sql = self.validate_sql(res.sql)
             self.log("      通过（单条 SELECT）")
@@ -273,7 +369,7 @@ class DataAgent:
             gen = self.repair_sql(question, res.sql, str(e))
             res.sql = self.validate_sql(gen["sql"])
 
-        self.log("\n[3/5] 执行 ...")
+        self.log("\n[3/6] 执行 ...")
         for attempt in range(1, MAX_RETRY + 1):
             res.attempts = attempt
             try:
@@ -295,12 +391,21 @@ class DataAgent:
                 res.healed = True
 
         # (6) 解读
-        self.log("\n[4/5] 生成业务解读 ...")
+        self.log("\n[4/6] 生成业务解读 ...")
         res.interpretation = self.interpret(question, res.sql, res.df)
         self.log("      " + res.interpretation.replace("\n", "\n      "))
 
+        # (7) 自动出图
+        self.log("\n[5/6] 自动出图 ...")
+        try:
+            res.chart_path = self.visualize(question, res.df, metric=res.metric)
+            if res.chart_path:
+                self.log("      已生成: %s" % os.path.basename(res.chart_path))
+        except Exception as e:
+            self.log("      出图失败（不影响主流程）: %s" % str(e)[:80])
+
         res.seconds = time.time() - t0
-        self.log("\n[5/5] 完成（耗时 %.1fs，LLM 调用 %d 次，重试 %d 次）"
+        self.log("\n[6/6] 完成（耗时 %.1fs，LLM 调用 %d 次，重试 %d 次）"
                  % (res.seconds, self.llm.calls, res.attempts - 1))
         return res
 

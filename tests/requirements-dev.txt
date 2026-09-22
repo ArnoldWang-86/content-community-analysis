@@ -1,0 +1,5 @@
+# 测试相关依赖
+pytest>=8.0
+pytest-html>=4.0
+openpyxl>=3.1
+pyyaml>=6.0
